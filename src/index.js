@@ -18,6 +18,7 @@ import {
   collectSignals,
 } from "./strategy/signals.js";
 import { placeTradeWithRetry, startForcedCloseTimer } from "./trading/trader.js";
+import { FALLBACK_MULTIPLIERS } from "./trading/multipliers.js";
 import {
   initPortfolio,
   syncActiveSymbols,
@@ -230,7 +231,7 @@ async function main() {
 
           // Run SMC strategy
           const result = collectSignals({ h4: dfH4, m15: dfM15, m1: dfM1, symbol });
-          const { signal, breakdown, reason, bias } = result;
+          const { signal, breakdown, reason, bias, setup } = result;
 
           if (signal === 0) {
             console.log(`${symbol} | HOLD | H4 Bias: ${(bias || "none").toUpperCase()} | ${reason}`);
@@ -256,14 +257,18 @@ async function main() {
           // "Enter an amount equal to or lower than X" from Deriv.
           balance          = await getBalance(ws);
           lastApiCall      = Date.now();
-          const baseStake  = rm.calculateStake(balance);
+          const multiplier = FALLBACK_MULTIPLIERS[symbol] || 100;
+          const baseStake  = rm.calculateStakeForSetup(balance, {
+            entry: setup.entry, stopLoss: setup.stopLoss, multiplier,
+          });
           const volScalar  = getVolatilityScalar(dfM1);
           const stake      = parseFloat(Math.max(baseStake * volScalar, rm.minStake).toFixed(2));
-          const limitOrder = sltp.getMultiplierLimitOrder(stake);
-          const multiplier = 100;
+          const limitOrder = sltp.getStructuralLimitOrder(stake, multiplier, setup.entry, setup.stopLoss, setup.takeProfit)
+                           || sltp.getMultiplierLimitOrder(stake);
 
           console.log(
-            `\n${symbol} | ${label} | H4 Bias: ${bias.toUpperCase()} | Stake: $${stake.toFixed(2)}`
+            `\n${symbol} | ${label} | H4 Bias: ${bias.toUpperCase()} | Stake: $${stake.toFixed(2)} (x${multiplier}) | ` +
+            `Entry ${setup.entry} SL ${setup.stopLoss} TP ${setup.takeProfit} RR ${setup.rr}`
           );
           console.log(getTradeReason({ h4: dfH4, m15: dfM15, m1: dfM1, symbol }));
 

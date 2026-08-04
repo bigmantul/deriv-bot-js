@@ -25,6 +25,7 @@ import {
   SIG_SELL,
 } from "../src/strategy/signals.js";
 import { placeTradeWithRetry, startForcedCloseTimer, cancelForcedCloseTimer, closeTrade, resetMultiplierCache } from "../src/trading/trader.js";
+import { FALLBACK_MULTIPLIERS } from "../src/trading/multipliers.js";
 import { RiskManager, StopLossTakeProfit } from "../src/risk/risk-manager.js";
 import { Trade, User, BotLog }             from "./db.js";
 import {
@@ -686,6 +687,7 @@ async function runUserBot(user, stopSignal) {
     maxOpenTrades:        user.risk.maxOpenTrades,
     maxConsecutiveLosses: user.risk.maxConsecutiveLosses,
   });
+  const sltp = new StopLossTakeProfit();
 
   const portfolio     = createPortfolio(user._id);
   let lastSummaryDate = "";
@@ -849,7 +851,7 @@ async function runUserBot(user, stopSignal) {
 
           // ── RUN SMC BIBLE STRATEGY ────────────────────
           const result = collectSignals({ h4: dfH4, m15: dfM15, m1: dfM1, symbol });
-          const { signal, breakdown, reason, bias } = result;
+          const { signal, breakdown, reason, bias, setup } = result;
 
           if (signal === 0) {
             await log(userId,
@@ -873,6 +875,7 @@ async function runUserBot(user, stopSignal) {
 
           // Fixed dollar stake — user sets amount directly (min $1)
           const stake      = parseFloat(Math.max(freshUser.risk.stakeAmount || 1.00, 1.00).toFixed(2));
+          const multiplier = FALLBACK_MULTIPLIERS[symbol] || 100;
           // Deriv deducts commission from the stake up front on multiplier
           // contracts, so the maximum loss you can ever actually realize
           // is always slightly LESS than 100% of the stake — a stop_loss
@@ -882,11 +885,16 @@ async function runUserBot(user, stopSignal) {
           // 100%+ setting (accidental or intentional) can never break
           // every single trade for this reason again.
           const safeStopLossPct = Math.min(freshUser.risk.stopLossPct, 0.95);
-          const limitOrder = {
+          // Prefer the SMC engine's own structural SL/TP (converted to
+          // dollar terms for the multiplier contract) — this makes the
+          // RR the strategy validated on entry (>=3, or >=4 for FVG)
+          // the RR that's actually placed on the order. Falls back to
+          // the user's configured stopLossPct/takeProfitPct only if a
+          // setup somehow has no price levels attached.
+          const limitOrder = sltp.getStructuralLimitOrder(stake, multiplier, setup.entry, setup.stopLoss, setup.takeProfit) || {
             stop_loss:   parseFloat((stake * safeStopLossPct).toFixed(2)),
             take_profit: parseFloat((stake * freshUser.risk.takeProfitPct).toFixed(2)),
           };
-          const multiplier = 100;
 
           // Log full strategy breakdown
           await log(userId,
