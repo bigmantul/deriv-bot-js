@@ -9,17 +9,20 @@
 //    All user bots read from this cache instantly —
 //    they NEVER call the Deriv candle API directly.
 //
-//  Timeframes cached (Daily Bias Strategy):
-//    D1 (86400) — daily bias detection
-//    H1 (3600)  — 1H confluence check
-//    M15 (900)  — entry confirmation
+//  Timeframes cached (SMC Bible Strategy):
+//    H4  (14400) — directional bias, premium/discount, major POI
+//    M15 (900)   — intraday structure, POI refinement, sweep
+//    M1  (60)    — execution: CHoCH, internal BOS, OB/FVG entry
 //
-//  NOTE ON TTL: Daily candles only change once per day, so
-//  re-fetching them every 90s like 15M candles would be
-//  wasteful and pointless. Each granularity now has its
-//  own TTL — D1 refreshes every 30 minutes (plenty fast
-//  to catch a new daily candle forming), H1/M15 keep the
-//  original fast refresh for timely entries.
+//  NOTE ON TTL: H4 candles only change every 4h, so re-fetching
+//  them every 90s would be wasteful. M1 is the execution
+//  timeframe, so it needs the freshest data the scanner can give
+//  it — but it's still bounded by SCAN_INTERVAL (85s), meaning a
+//  live M1 signal can lag up to ~85s behind the real close. That's
+//  an inherent limitation of the shared-scanner architecture at M1
+//  granularity, not something this cache layer alone can fix — if
+//  M1 timing precision becomes a problem, the scanner would need
+//  its own faster M1-only sub-loop.
 // ═══════════════════════════════════════════════════════
 
 import { sendMessage, connectWebSocket } from "../utils/ws-client.js";
@@ -27,9 +30,9 @@ import { connectForMode }                from "../auth/deriv-auth.js";
 
 // Per-granularity cache TTLs (ms)
 const TTL_BY_GRANULARITY = {
-  86400: 30 * 60 * 1000,  // D1  — refresh every 30 min, plenty for daily bias
-  3600:  90 * 1000,        // H1  — refresh every 90s
+  14400: 15 * 60 * 1000,  // H4  — refresh every 15 min, plenty for H4 bias
   900:   90 * 1000,        // M15 — refresh every 90s
+  60:    20 * 1000,        // M1  — refresh as often as the scan loop allows
 };
 const DEFAULT_TTL = 90 * 1000;
 
@@ -41,8 +44,8 @@ const pending = new Map(); // symbol+gran → Promise (dedup concurrent requests
 let scannerRunning = false;
 let scannerWs      = null;
 
-// All timeframes needed by the Daily Bias strategy
-const GRANULARITIES = [86400, 3600, 900];
+// All timeframes needed by the SMC strategy
+const GRANULARITIES = [14400, 900, 60];
 
 function ttlFor(granularity) {
   return TTL_BY_GRANULARITY[granularity] ?? DEFAULT_TTL;
@@ -51,15 +54,15 @@ function ttlFor(granularity) {
 // ── PUBLIC API ────────────────────────────────────────
 
 /**
- * Get all 3 timeframes for a symbol (Daily Bias strategy).
+ * Get all 3 timeframes for a symbol (SMC strategy).
  * Returns from cache if fresh — never waits for API.
  * Falls back to direct fetch only if cache is empty.
  */
 export async function getCachedMultiTf(ws, symbol) {
-  const d1  = await getCachedCandles(ws, symbol, 86400, 60);
-  const h1  = await getCachedCandles(ws, symbol, 3600,  200);
+  const h4  = await getCachedCandles(ws, symbol, 14400, 100);
   const m15 = await getCachedCandles(ws, symbol, 900,   200);
-  return { d1, h1, m15 };
+  const m1  = await getCachedCandles(ws, symbol, 60,    200);
+  return { h4, m15, m1 };
 }
 
 /**
@@ -134,7 +137,7 @@ async function fetchCandles(ws, symbol, granularity, count) {
  * Called ONCE on server startup.
  * Uses its own WebSocket — user bots never fetch candles directly.
  *
- * D1 candles are skipped on scan cycles where they're still
+ * H4 candles are skipped on scan cycles where they are still
  * fresh (per TTL_BY_GRANULARITY), saving API calls — there's
  * no point re-fetching the daily candle every 85 seconds.
  *
@@ -146,7 +149,7 @@ async function fetchCandles(ws, symbol, granularity, count) {
 export async function startGlobalScanner(symbols, token, appId, mode = "demo") {
   if (scannerRunning) return;
   scannerRunning = true;
-  console.log(`🔭 Global candle scanner starting — ${symbols.length} symbols × ${GRANULARITIES.length} TFs (D1/H1/M15)`);
+  console.log(`🔭 Global candle scanner starting — ${symbols.length} symbols × ${GRANULARITIES.length} TFs (H4/M15/M1)`);
 
   async function runScan() {
     try {
@@ -164,14 +167,14 @@ export async function startGlobalScanner(symbols, token, appId, mode = "demo") {
           const cached = cache.get(key);
           const ttl    = ttlFor(gran);
 
-          // Skip if still fresh per this granularity's TTL (mainly D1)
+          // Skip if still fresh per this granularity's TTL (mainly H4)
           if (cached && (Date.now() - cached.fetchedAt) < ttl) {
             skipped++;
             continue;
           }
 
           try {
-            const count = gran === 86400 ? 60 : 200;
+            const count = gran === 14400 ? 100 : 200;
             const candles = await fetchCandles(scannerWs, symbol, gran, count);
             if (candles.length > 10) {
               cache.set(key, { candles, fetchedAt: Date.now() });
@@ -186,7 +189,7 @@ export async function startGlobalScanner(symbols, token, appId, mode = "demo") {
         }
       }
 
-      console.log(`✅ [scanner] Refreshed ${fetched} candle sets (${skipped} skipped — still fresh, mostly D1)`);
+      console.log(`✅ [scanner] Refreshed ${fetched} candle sets (${skipped} skipped — still fresh, mostly H4)`);
       scannerWs.close();
     } catch (e) {
       console.error(`[scanner] Error:`, e.message);

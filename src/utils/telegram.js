@@ -1,7 +1,7 @@
 ﻿// ═══════════════════════════════════════════════════════
 //  src/utils/telegram.js
 //
-//  Notifications fully integrated with the Daily Bias
+//  Notifications fully integrated with the SMC Bible
 //  Strategy (4-stage state machine: D1 -> Trend -> 1H -> 15M)
 // ═══════════════════════════════════════════════════════
 
@@ -80,9 +80,9 @@ export function notifyStartup(balance, mode, label, botToken, chatId) {
     `🤖 <b>${label || "Bot"} — Started</b>\n` +
     `Mode       : ${(mode || "demo").toUpperCase()}\n` +
     `Balance    : $${balance.toFixed(2)}\n` +
-    `Engine     : Daily Bias Strategy (4-stage)\n` +
-    `Stages     : Daily Bias → Trend Check → 1H Confirm → 15M Entry\n` +
-    `Timeframes : D1 / H1 / M15\n` +
+    `Engine     : SMC Bible Strategy (H4 -> M15 -> M1)\n` +
+    `Stages     : H4 Bias/POI → M15 Sweep → M1 CHoCH+iBOS+OB/FVG Entry\n` +
+    `Timeframes : H4 / M15 / M1\n` +
     `FX Session : London + New York + overlap only\n` +
     `Synthetics : 24/7, no session restriction`,
     botToken, chatId
@@ -93,7 +93,7 @@ export function notifyStartup(balance, mode, label, botToken, chatId) {
 export function notifyTradeOpened({
   symbol, direction, stake, multiplier, limitOrder,
   contractId, label, botToken, chatId,
-  breakdown, dailyBias,
+  breakdown, bias,
 }) {
   const isBuy  = direction === "MULTUP";
   const icon   = isBuy ? "🟢 BUY" : "🔴 SELL";
@@ -106,7 +106,7 @@ export function notifyTradeOpened({
 
   return sendMessage(
     `${icon} <b>${label || "Bot"} — ${symbol}</b>\n` +
-    `Daily Bias : ${(dailyBias || "—").toUpperCase()}\n` +
+    `H4 Bias    : ${(bias || "—").toUpperCase()}\n` +
     `Contract   : ${contractId}\n` +
     `Stake      : $${stake.toFixed(2)} x${multiplier}` +
     slText + tpText +
@@ -197,7 +197,7 @@ export function notifyDailySummary({ balance, dailyPnl, openTrades, consecutiveL
 // ── CYCLE SCAN ────────────────────────────────────────
 //
 // r.status: "LOCKED" | "CLOSED" | "FILTERED" | "HOLD" | "BUY" | "SELL"
-// r.dailyBias: "bullish" | "bearish" | "none" (present on HOLD/BUY/SELL)
+// r.bias: "bullish" | "bearish" | "none" (present on HOLD/BUY/SELL)
 // r.breakdown: [{ step, result, reason }] (present on HOLD/BUY/SELL)
 // r.rejectReason: short reason string (present on HOLD)
 //
@@ -271,7 +271,7 @@ export function notifyCycleScan({ balance, openTrades, maxTrades, session, resul
 
     // ── HOLD ───────────────────────────────────────────
     } else if (r.status === "HOLD") {
-      const bias = (r.dailyBias || "none").toUpperCase();
+      const bias = (r.bias || "none").toUpperCase();
       const biasIcon = bias === "BULLISH" ? "🟢" : bias === "BEARISH" ? "🔴" : "⬜";
 
       // Find which stage is currently blocking, for a quick one-line summary
@@ -289,9 +289,9 @@ export function notifyCycleScan({ balance, openTrades, maxTrades, session, resul
     // ── BUY / SELL ─────────────────────────────────────
     } else if (r.status === "BUY" || r.status === "SELL") {
       const icon = r.status === "BUY" ? "🟢" : "🔴";
-      const bias = (r.dailyBias || "—").toUpperCase();
+      const bias = (r.bias || "—").toUpperCase();
 
-      bodyLines.push(`${icon} ${sym} | ${r.status} | Daily Bias: ${bias}`);
+      bodyLines.push(`${icon} ${sym} | ${r.status} | H4 Bias: ${bias}`);
     }
   }
 

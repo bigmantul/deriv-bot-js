@@ -1,12 +1,11 @@
 // ═══════════════════════════════════════════════════════
 //  dashboard/bot-manager.js
 //
-//  Daily Bias Strategy integration:
-//    - Fetches 3 timeframes (D1 / H1 / M15)
-//    - Step 1: Daily candle bias (bullish/bearish/none)
-//    - Step 2: Trend alignment check (HH/HL or LH/LL)
-//    - Step 3: 1H confluence check
-//    - Step 4: 15M entry on rejection/engulfing candle
+//  SMC Bible Strategy integration:
+//    - Fetches 3 timeframes (H4 / M15 / M1)
+//    - H4: directional bias, premium/discount, major POI
+//    - M15: intraday structure, POI refinement, liquidity sweep
+//    - M1: execution — CHoCH, internal BOS, OB/FVG entry
 //    - All existing infrastructure (risk, trailing stop,
 //      forced close, portfolio locking) unchanged
 // ═══════════════════════════════════════════════════════
@@ -19,7 +18,7 @@ import {
   getTradeReason,
   getVolatilityScalar,
   marketIsTradeable,
-  get15mTrend,
+  getH4Trend,
   sessionName,
   isMarketOpen,
   SIG_BUY,
@@ -274,7 +273,7 @@ function buildForcedCloseHandler({ userId, symbol, direction, stake, label, botT
   };
 }
 
-async function monitorOpenTrades(ws, userId, label, portfolio, dfD1Cache, riskSettings, botToken, chatId, rm, user) {
+async function monitorOpenTrades(ws, userId, label, portfolio, dfH4Cache, riskSettings, botToken, chatId, rm, user) {
   try {
     const openTrades = await Trade.find({ userId, status: "open" });
     if (!openTrades.length) return [];
@@ -334,8 +333,8 @@ async function monitorOpenTrades(ws, userId, label, portfolio, dfD1Cache, riskSe
         const distToTP = takeProfitVal - currentPnl;    // more profit needed to hit TP
 
         // 3: daily bias agreement
-        const d1Candles   = dfD1Cache.get(trade.symbol);
-        const currentBias = (d1Candles && d1Candles.length >= 3) ? get15mTrend(d1Candles) : "neutral";
+        const h4Candles   = dfH4Cache.get(trade.symbol);
+        const currentBias = (h4Candles && h4Candles.length >= 3) ? getH4Trend(h4Candles) : "neutral";
         const biasFlipped = currentBias !== "neutral" && currentBias !== tradeBias;
         const biasStatus  = currentBias === "neutral" ? "NEUTRAL" : (biasFlipped ? "REVERSED" : "AGREES");
 
@@ -421,7 +420,7 @@ async function monitorOpenTrades(ws, userId, label, portfolio, dfD1Cache, riskSe
         const statusLines = [
           `[${label}] ${trade.symbol} (${dirLabel}) | LIVE STATUS`,
           `PnL: $${currentPnl.toFixed(4)} | SL: $${stopLossVal.toFixed(2)} (${distToSL.toFixed(4)} away) | TP: $${takeProfitVal.toFixed(2)} (${distToTP.toFixed(4)} away)`,
-          `Daily Bias: ${currentBias.toUpperCase()} (${biasStatus})`,
+          `H4 Bias: ${currentBias.toUpperCase()} (${biasStatus})`,
           `No-Profit Cutoff: ${cutoffText}`,
           `PnL Lock: ${pnlLockText}`,
           `Forced Close Timer: ${forcedCloseText}`,
@@ -679,7 +678,7 @@ async function runUserBot(user, stopSignal) {
   const botToken = TELEGRAM_BOT_TOKEN;
   const chatId   = user.telegramChatId;
 
-  await log(userId, `[${label}] Bot starting — Daily Bias Strategy (D1 -> H1 -> M15)`, "info");
+  await log(userId, `[${label}] Bot starting — SMC Bible Strategy (H4 -> M15 -> M1)`, "info");
 
   const rm = new RiskManager({
     riskPct:              user.risk.riskPct,
@@ -690,7 +689,7 @@ async function runUserBot(user, stopSignal) {
 
   const portfolio     = createPortfolio(user._id);
   let lastSummaryDate = "";
-  const dfD1Cache      = new Map();
+  const dfH4Cache      = new Map();
 
   while (!stopSignal.stopped) {
     let lastApiCall = Date.now();
@@ -736,7 +735,7 @@ async function runUserBot(user, stopSignal) {
         await syncTradeStatuses(ws, user._id, label, botToken, chatId, rm);
         lastApiCall = Date.now();
 
-        const liveStatuses = await monitorOpenTrades(ws, user._id, label, portfolio, dfD1Cache, freshUser.risk, botToken, chatId, rm, freshUser);
+        const liveStatuses = await monitorOpenTrades(ws, user._id, label, portfolio, dfH4Cache, freshUser.risk, botToken, chatId, rm, freshUser);
         lastApiCall = Date.now();
 
         const currentOpen = await portfolio.sync(ws);
@@ -788,7 +787,7 @@ async function runUserBot(user, stopSignal) {
         }
 
         const slotsLeft    = rm.maxOpen - currentOpen;
-        await log(userId, `[${label}] ✅ ${slotsLeft} slot(s) available — scanning (Daily Bias)...`, "info");
+        await log(userId, `[${label}] ✅ ${slotsLeft} slot(s) available — scanning (SMC)...`, "info");
 
         const cycleResults = [];
         let   placed       = 0;
@@ -832,35 +831,35 @@ async function runUserBot(user, stopSignal) {
             continue;
           }
 
-          // Read from global cache — 3 timeframes (D1/H1/M15)
+          // Read from global cache — 3 timeframes (H4/M15/M1)
           lastApiCall    = Date.now();
           const tf       = await getCachedMultiTf(ws, symbol);
-          const { d1: dfD1, h1: dfH1, m15: dfM15 } = tf;
+          const { h4: dfH4, m15: dfM15, m1: dfM1 } = tf;
 
-          if (dfD1 && dfD1.length > 0) dfD1Cache.set(symbol, dfD1);
+          if (dfH4 && dfH4.length > 0) dfH4Cache.set(symbol, dfH4);
 
-          if (!dfM15 || dfM15.length < 2) continue;
+          if (!dfM1 || dfM1.length < 2) continue;
 
-          // Global volatility filter
-          if (!marketIsTradeable(dfM15)) {
+          // Global volatility filter — measured on M1, the execution timeframe
+          if (!marketIsTradeable(dfM1)) {
             await log(userId, `[${label}] ${symbol} | ⛔ FILTERED — poor volatility`, "info");
             cycleResults.push({ symbol, status: "FILTERED" });
             continue;
           }
 
-          // ── RUN DAILY BIAS STRATEGY ────────────────────
-          const result = collectSignals({ d1: dfD1, h1: dfH1, m15: dfM15, symbol });
-          const { signal, breakdown, reason, dailyBias } = result;
+          // ── RUN SMC BIBLE STRATEGY ────────────────────
+          const result = collectSignals({ h4: dfH4, m15: dfM15, m1: dfM1, symbol });
+          const { signal, breakdown, reason, bias } = result;
 
           if (signal === 0) {
             await log(userId,
-              `[${label}] ${symbol} | HOLD | Bias: ${(dailyBias || "none").toUpperCase()} | ${reason}`,
+              `[${label}] ${symbol} | HOLD | Bias: ${(bias || "none").toUpperCase()} | ${reason}`,
               "info"
             );
             cycleResults.push({
               symbol,
               status:       "HOLD",
-              dailyBias:    dailyBias || "none",
+              bias:    bias || "none",
               strength:     0,
               rejectReason: reason,
               breakdown,
@@ -891,15 +890,15 @@ async function runUserBot(user, stopSignal) {
 
           // Log full strategy breakdown
           await log(userId,
-            `[${label}] ${symbol} | ${label2}! | Daily Bias: ${dailyBias.toUpperCase()} | Stake: $${stake} | SL=$${limitOrder.stop_loss} TP=$${limitOrder.take_profit}`,
+            `[${label}] ${symbol} | ${label2}! | H4 Bias: ${bias.toUpperCase()} | Stake: $${stake} | SL=$${limitOrder.stop_loss} TP=$${limitOrder.take_profit}`,
             "trade"
           );
-          await log(userId, getTradeReason({ d1: dfD1, h1: dfH1, m15: dfM15, symbol }), "trade");
+          await log(userId, getTradeReason({ h4: dfH4, m15: dfM15, m1: dfM1, symbol }), "trade");
 
           cycleResults.push({
             symbol,
             status:    label2,
-            dailyBias,
+            bias,
             breakdown,
           });
 
@@ -968,7 +967,7 @@ async function runUserBot(user, stopSignal) {
               limitOrder,
               contractId, label, botToken, chatId,
               breakdown,
-              dailyBias,
+              bias,
             });
 
             await log(userId,

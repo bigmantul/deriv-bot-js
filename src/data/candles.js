@@ -1,12 +1,13 @@
 // ═══════════════════════════════════════════════════════
 //  src/data/candles.js
 //
-//  Timeframe stack (Daily Bias Strategy):
-//    d1  = 86400s  → Daily bias detection
-//    h1  = 3600s   → 1H confluence check
-//    m15 = 900s    → Entry confirmation
+//  Timeframe stack (SMC Bible Strategy):
+//    h4  = 14400s → H4 directional bias, premium/discount, major POI
+//    m15 = 900s   → intraday structure, POI refinement, liquidity sweep
+//    m1  = 60s    → execution: CHoCH, internal BOS, OB/FVG entry
 //
-//  4H/30M are no longer used by the current strategy.
+//  D1/H1/30M are no longer used by the current strategy
+//  (replaced the Daily Bias strategy on 2026-08-04).
 // ═══════════════════════════════════════════════════════
 
 import { sendMessage } from "../utils/ws-client.js";
@@ -58,21 +59,23 @@ export async function getCandles(ws, symbol, granularity = 3600, count = 200) {
 }
 
 /**
- * Fetch the 3 timeframes used by the Daily Bias strategy:
+ * Fetch the 3 timeframes used by the SMC strategy:
  *
- *   d1  = 86400s  (Daily — bias detection)
- *   h1  = 3600s   (1H — confluence check)
- *   m15 = 900s    (15M — entry confirmation)
+ *   h4  = 14400s (H4  — bias, premium/discount, major POI)
+ *   m15 = 900s   (M15 — intraday structure, POI refinement, sweep)
+ *   m1  = 60s    (M1  — execution: CHoCH, internal BOS, OB/FVG entry)
  *
- * Daily candles need fewer bars (60 = ~2 months is plenty
- * for prev-day-high/low + swing structure checks) — no
- * need to request 200 daily candles.
+ * H4 needs fewer bars than M1 — 100 H4 candles is ~16 days of
+ * structure, plenty for swing/POI detection. M1 needs a deep-ish
+ * window (200 bars = ~3.3 hours) to have enough closed candles for
+ * the sweep -> CHoCH -> internal BOS sequence to complete inside
+ * its own timing windows.
  */
 export async function getMultiTf(ws, symbol) {
-  const [d1, h1, m15] = await Promise.all([
-    getCandles(ws, symbol, 86400, 60),
-    getCandles(ws, symbol, 3600,  200),
+  const [h4, m15, m1] = await Promise.all([
+    getCandles(ws, symbol, 14400, 100),
     getCandles(ws, symbol, 900,   200),
+    getCandles(ws, symbol, 60,    200),
   ]);
-  return { d1, h1, m15 };
+  return { h4, m15, m1 };
 }

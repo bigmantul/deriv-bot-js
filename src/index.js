@@ -11,7 +11,7 @@ import { SYMBOLS }                       from "./config/symbols.js";
 import {
   getVolatilityScalar,
   marketIsTradeable,
-  get15mTrend,
+  getH4Trend,
   getTradeReason,
   sessionName,
   isMarketOpen,
@@ -78,8 +78,8 @@ function sleep(secs) {
 async function main() {
   console.log("═══════════════════════════════════════════════");
   console.log("  Launching bot...");
-  console.log("  Strategy  : Daily Bias Strategy (3-stage state machine)");
-  console.log("  Stages    : Daily Bias -> 1H Confirm -> 15M Entry");
+  console.log("  Strategy  : SMC Bible Strategy (H4 -> M15 -> M1)");
+  console.log("  Stages    : H4 Bias/POI -> M15 Sweep -> M1 CHoCH+iBOS+OB/FVG Entry");
   console.log("  Timeframes: D1 / H1 / M15");
   console.log("═══════════════════════════════════════════════\n");
 
@@ -214,30 +214,30 @@ async function main() {
             continue;
           }
 
-          // Fetch the 3 timeframes used by the Daily Bias strategy
+          // Fetch the 3 timeframes used by the SMC strategy
           const tf = await getMultiTf(ws, symbol);
-          const { d1: dfD1, h1: dfH1, m15: dfM15 } = tf;
+          const { h4: dfH4, m15: dfM15, m1: dfM1 } = tf;
           lastApiCall = Date.now();
 
-          if (!dfM15 || dfM15.length < 2) continue;
+          if (!dfM1 || dfM1.length < 2) continue;
 
-          // Global volatility filter
-          if (!marketIsTradeable(dfM15)) {
+          // Global volatility filter — now measured on M1, the execution timeframe
+          if (!marketIsTradeable(dfM1)) {
             console.log(`${symbol} | FILTERED (poor market conditions)`);
             cycleResults.push({ symbol, status: "FILTERED" });
             continue;
           }
 
-          // Run Daily Bias strategy
-          const result = collectSignals({ d1: dfD1, h1: dfH1, m15: dfM15, symbol });
-          const { signal, breakdown, reason, dailyBias } = result;
+          // Run SMC strategy
+          const result = collectSignals({ h4: dfH4, m15: dfM15, m1: dfM1, symbol });
+          const { signal, breakdown, reason, bias } = result;
 
           if (signal === 0) {
-            console.log(`${symbol} | HOLD | Bias: ${(dailyBias || "none").toUpperCase()} | ${reason}`);
+            console.log(`${symbol} | HOLD | H4 Bias: ${(bias || "none").toUpperCase()} | ${reason}`);
             cycleResults.push({
               symbol,
-              status:    "HOLD",
-              dailyBias: dailyBias || "none",
+              status: "HOLD",
+              bias:   bias || "none",
               reason,
             });
             continue;
@@ -257,17 +257,17 @@ async function main() {
           balance          = await getBalance(ws);
           lastApiCall      = Date.now();
           const baseStake  = rm.calculateStake(balance);
-          const volScalar  = getVolatilityScalar(dfM15);
+          const volScalar  = getVolatilityScalar(dfM1);
           const stake      = parseFloat(Math.max(baseStake * volScalar, rm.minStake).toFixed(2));
           const limitOrder = sltp.getMultiplierLimitOrder(stake);
           const multiplier = 100;
 
           console.log(
-            `\n${symbol} | ${label} | Daily Bias: ${dailyBias.toUpperCase()} | Stake: $${stake.toFixed(2)}`
+            `\n${symbol} | ${label} | H4 Bias: ${bias.toUpperCase()} | Stake: $${stake.toFixed(2)}`
           );
-          console.log(getTradeReason({ d1: dfD1, h1: dfH1, m15: dfM15, symbol }));
+          console.log(getTradeReason({ h4: dfH4, m15: dfM15, m1: dfM1, symbol }));
 
-          cycleResults.push({ symbol, status: label, dailyBias });
+          cycleResults.push({ symbol, status: label, bias });
 
           // Place trade
           const tradeResult = await placeTradeWithRetry(ws, symbol, direction, stake, limitOrder);

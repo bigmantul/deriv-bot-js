@@ -1,50 +1,31 @@
 // ═══════════════════════════════════════════════════════
 //  src/strategy/signals.js
 //
-//  DAILY BIAS STRATEGY — 3-STAGE STATE MACHINE + 5-VOTER
-//  CONFIRMATION LAYER + 2-ATTEMPT ENTRY WINDOW
+//  SMC BIBLE STRATEGY — H4 → M15 → M1 deterministic engine
 //
-//  Stage 1: Daily Bias — computed once per trading day, after the
-//           previous daily candle closes (Rule A: fresh 3-candle
-//           reversal, overrides Rule B; Rule B: 30-candle HTF
-//           majority trend, gated by yesterday's candle confirming
-//           the same direction).
-//  Stage 2: 1H Confirmation — the most recent CLOSED 1H candle must
-//           have BOTH its open AND close beyond yesterday's D1 high
-//           (bullish) or D1 low (bearish), AND pass the valid-candle
-//           body>wick test. Confirmed -> Entry Mode, with a fresh
-//           2-attempt window and the confirming H1 candle's own
-//           high/low remembered as "the zone".
-//  Stage 3: 15M Entry — only the 1st or 2nd 15M candle after Entry
-//           Mode starts gets a chance to trigger. Each candidate
-//           candle must pass BOTH mandatory gates (valid shape +
-//           closes beyond the zone) AND clear the voting layer: 5
-//           independent voters (RSI reversal out of oversold/
-//           overbought, EMA20 slope/alignment, 3+ candle close
-//           streak, strong close within its own range, minimum
-//           clearance beyond the zone in ATR terms) — at least 3 of
-//           5 must agree with the bias direction. If neither of the
-//           2 attempts clears both bars, the setup is ABANDONED —
-//           Stage 2 will not re-arm on just any later H1 breakout;
-//           it first requires a closed H1 candle to close fully
-//           back inside yesterday's D1 range, then watches for a
-//           fresh breakout with a brand-new zone and attempt window.
+//  H4:  directional bias, market structure, premium/discount,
+//       major liquidity, major POI.
+//  M15: intraday market structure, liquidity, POI refinement,
+//       confirms price has returned to the H4 POI, M15 sweep.
+//  M1:  execution — CHoCH, internal BOS (the "C-I model"),
+//       Order Block / FVG entry.
 //
-//  Backtested against 1yr of real data across all 48 symbols before
-//  going live: this combination (voting + attempt cap) came out
-//  ahead of either piece alone — PF 4.51 vs. 3.98 (attempt-cap
-//  only) vs. 3.98 (voting only, no cap) vs. 4.61 (neither, but at
-//  732 trades vs. this version's 540 — more trades, no filtering).
+//  Every rule maps to a deterministic numeric/structural
+//  condition — no discretionary chart interpretation. Only
+//  CLOSED candles are ever used to confirm structure, BOS,
+//  CHoCH, sweeps, or displacement (no look-ahead bias). The
+//  last element of every candle array passed in is treated as
+//  the currently-forming candle and is dropped before analysis.
 //
-//  SESSION RULE: Daily bias (Stage 1) is computed any time of day.
-//  Stage 2 + Stage 3 only run for FX/Metals during London, New
-//  York, or the overlap. Synthetics/Crypto run 24/7, unaffected.
+//  What's directly from the SMC Bible vs. what's an
+//  implementation parameter is documented inline throughout —
+//  see SMC_CONFIG below for every numeric threshold that had to
+//  be introduced to make the strategy executable.
 //
-//  STATE PERSISTENCE: Entry Mode, the attempt counter, and the
-//  retracement gate all persist across scan cycles per symbol. See
-//  SymbolStateStore below.
-//
-//  Timeframes used: D1 → H1 → M15
+//  This replaces the old Daily Bias (D1 → H1 → M15) strategy
+//  entirely, effective 2026-08-04. That strategy's code lives on
+//  in signals-voting-candidate.js for reference/backtest
+//  comparison but is no longer wired into the live bot.
 // ═══════════════════════════════════════════════════════
 
 // ── SIGNAL CONSTANTS ──────────────────────────────────
@@ -95,25 +76,14 @@ export function sessionName() {
   return "Asian/off-peak";
 }
 
+// ── PER-SYMBOL STATE ───────────────────────────────────
 const symbolState = new Map();
 
 function getState(symbol) {
   if (!symbolState.has(symbol)) {
     symbolState.set(symbol, {
-      dailyBiasEpoch: null,
-      dailyBias:     "none",
-      dailyBiasMeta: null,
-      entryMode:     false,
-      entryModeReason: "",
-      entryModeH1Epoch: null,
-      entryModeH1High:  null,
-      entryModeH1Low:   null,
-      pulledBack:       false,
-      m15ScanEpoch:     null,
-      lastM15Epoch:  null,
-      lastVoteReason: null,
-      m15EntryAttempts:    0,
-      awaitingRetracement: false,
+      lastSignalEpoch: null, // M1 entry-candle epoch of the last signal fired,
+                              // so the same setup doesn't re-fire every scan cycle
     });
   }
   return symbolState.get(symbol);
@@ -123,6 +93,7 @@ export function resetSymbolState(symbol) {
   symbolState.delete(symbol);
 }
 
+// ── GENERIC HELPERS (timeframe-agnostic) ──────────────
 function calcAtr(df, period = 14) {
   if (!df || df.length < period + 1) return 0;
   const trs = [];
@@ -157,17 +128,14 @@ export function getVolatilityScalar(df) {
   return parseFloat(Math.max(0.25, Math.min(1.0, 0.003 / pct)).toFixed(4));
 }
 
-function candleBody(c)  { return Math.abs(c.close - c.open); }
-function candleRange(c) { return c.high - c.low; }
-
-// Trend-STRENGTH classifier (trending vs. ranging), distinct from
-// getSimpleTrend() below which only answers direction. Uses
-// Kaufman's Efficiency Ratio. Used by backtest/walk-forward.js for
-// regime-bucketed analysis — NOT called anywhere in collectSignals()
-// or the live entry path below.
-export function classifyD1Regime(d1Window, { lookback = 30, excludeForming = true, trendThreshold = 0.15 } = {}) {
-  if (!d1Window || d1Window.length < 3) return { trending: false, agreeRatio: 0 };
-  let candles = excludeForming ? d1Window.slice(0, -1) : d1Window;
+// Kept for the backtest walk-forward regime bucketer and the
+// (not-yet-wired-in) confluence-votes.js — a generic trend-strength
+// classifier via Kaufman's Efficiency Ratio. Works on any candle
+// window; historically called with the D1 window, now typically
+// called with the H4 window instead.
+export function classifyD1Regime(window, { lookback = 30, excludeForming = true, trendThreshold = 0.15 } = {}) {
+  if (!window || window.length < 3) return { trending: false, agreeRatio: 0 };
+  let candles = excludeForming ? window.slice(0, -1) : window;
   if (lookback && candles.length > lookback) candles = candles.slice(-lookback);
   if (candles.length < 3) return { trending: false, agreeRatio: 0 };
   const netMove = Math.abs(candles[candles.length - 1].close - candles[0].close);
@@ -177,452 +145,453 @@ export function classifyD1Regime(d1Window, { lookback = 30, excludeForming = tru
   return { trending: agreeRatio >= trendThreshold, agreeRatio: +agreeRatio.toFixed(4) };
 }
 
-function getSwings(df, lookback = 5) {
-  const highs = [], lows = [];
-  const end = df.length - lookback;
-  for (let i = lookback; i < end; i++) {
-    const sliceH = df.slice(i - lookback, i + lookback + 1).map(c => c.high);
-    const sliceL = df.slice(i - lookback, i + lookback + 1).map(c => c.low);
-    if (df[i].high === Math.max(...sliceH)) highs.push({ idx: i, price: df[i].high });
-    if (df[i].low  === Math.min(...sliceL)) lows.push({  idx: i, price: df[i].low  });
-  }
-  return { highs, lows };
-}
-
-function getSimpleTrend(dfD1, lookback = 30) {
-  if (!dfD1 || dfD1.length < 2) return "neutral";
-  const closed = dfD1.slice(0, dfD1.length - 1);
-  const recent = closed.slice(-lookback);
-  let bullishCount = 0, bearishCount = 0;
-  for (const c of recent) {
-    if (c.close > c.open) bullishCount++;
-    else if (c.close < c.open) bearishCount++;
-  }
-  if (bearishCount > bullishCount) return "bearish";
-  if (bullishCount > bearishCount) return "bullish";
-  return "neutral";
-}
-
-function validateDailyCandle(candle) {
-  const body  = candle.close - candle.open;
-  const range = candleRange(candle);
-  if (range === 0 || body === 0) {
-    return { valid: false, direction: null, reason: "Zero-range/zero-body candle" };
-  }
-  if (body > 0) {
-    const bodyAbs = body;
-    const upperWick = candle.high - candle.close;
-    const wickValid = bodyAbs > upperWick;
-    const upperWickPct = (upperWick / bodyAbs) * 100;
-    if (wickValid) return { valid: true, direction: "bullish", wickPct: upperWickPct, reason: `Valid bullish — body (${bodyAbs.toFixed(5)}) > upper wick (${upperWick.toFixed(5)})` };
-    return { valid: false, direction: "bullish", wickPct: upperWickPct, reason: `Invalid bullish — upper wick (${upperWick.toFixed(5)}) >= body (${bodyAbs.toFixed(5)})` };
-  }
-  if (body < 0) {
-    const bodyAbs = -body;
-    const lowerWick = candle.close - candle.low;
-    const wickValid = bodyAbs > lowerWick;
-    const lowerWickPct = (lowerWick / bodyAbs) * 100;
-    if (wickValid) return { valid: true, direction: "bearish", wickPct: lowerWickPct, reason: `Valid bearish — body (${bodyAbs.toFixed(5)}) > lower wick (${lowerWick.toFixed(5)})` };
-    return { valid: false, direction: "bearish", wickPct: lowerWickPct, reason: `Invalid bearish — lower wick (${lowerWick.toFixed(5)}) >= body (${bodyAbs.toFixed(5)})` };
-  }
-  return { valid: false, direction: null, reason: "Doji / indecisive candle" };
-}
-
-function countConsecutiveValidCandles(dfD1) {
-  const len = dfD1.length;
-  if (len < 3) return { count: 0, direction: null, yesterdayValid: false, yesterdayDirection: null };
-  const yesterday = validateDailyCandle(dfD1[len - 2]);
-  if (!yesterday.valid) {
-    return { count: 0, direction: null, yesterdayValid: false, yesterdayDirection: yesterday.direction, yesterdayReason: yesterday.reason };
-  }
-  let count = 0;
-  const direction = yesterday.direction;
-  for (let i = len - 2; i >= 0; i--) {
-    const v = validateDailyCandle(dfD1[i]);
-    if (v.valid && v.direction === direction) count++; else break;
-  }
-  return { count, direction, yesterdayValid: true, yesterdayDirection: direction, yesterdayReason: yesterday.reason };
-}
-
-function computeDailyBias(dfD1) {
-  if (!dfD1 || dfD1.length < 5) {
-    return { bias: "none", reason: "Insufficient daily data (need at least 5 candles)" };
-  }
-  const seq = countConsecutiveValidCandles(dfD1);
-  const htfTrend = getSimpleTrend(dfD1, 30);
-  const ruleA_bearish = seq.yesterdayValid && seq.yesterdayDirection === "bearish" && seq.count >= 3;
-  const ruleA_bullish = seq.yesterdayValid && seq.yesterdayDirection === "bullish" && seq.count >= 3;
-  const ruleB_bearish = htfTrend === "bearish";
-  const ruleB_bullish = htfTrend === "bullish";
-
-  if (ruleA_bearish) {
-    const parts = [`Rule A: ${seq.count} consecutive valid bearish candles (overrides HTF trend if conflicting)`];
-    if (ruleB_bearish) parts.push(`Rule B also agrees`);
-    else if (ruleB_bullish) parts.push(`NOTE: Rule A reversal takes precedence over conflicting HTF trend`);
-    return { bias: "bearish", reason: `Bearish bias — ${parts.join(" + ")}` };
-  }
-  if (ruleA_bullish) {
-    const parts = [`Rule A: ${seq.count} consecutive valid bullish candles (overrides HTF trend if conflicting)`];
-    if (ruleB_bullish) parts.push(`Rule B also agrees`);
-    else if (ruleB_bearish) parts.push(`NOTE: Rule A reversal takes precedence over conflicting HTF trend`);
-    return { bias: "bullish", reason: `Bullish bias — ${parts.join(" + ")}` };
-  }
-  if (ruleB_bearish) {
-    if (seq.yesterdayValid && seq.yesterdayDirection === "bearish") {
-      return { bias: "bearish", reason: `Bearish bias — Rule B trend, confirmed by valid bearish daily candle` };
-    }
-    return { bias: "none", reason: `HOLD — Rule B trend is bearish but yesterday's candle doesn't confirm it` };
-  }
-  if (ruleB_bullish) {
-    if (seq.yesterdayValid && seq.yesterdayDirection === "bullish") {
-      return { bias: "bullish", reason: `Bullish bias — Rule B trend, confirmed by valid bullish daily candle` };
-    }
-    return { bias: "none", reason: `HOLD — Rule B trend is bullish but yesterday's candle doesn't confirm it` };
-  }
-  return { bias: "none", reason: `HOLD — Rule A failed, Rule B failed (HTF trend is ${htfTrend})` };
+function closed(df) {
+  return (df && df.length > 1) ? df.slice(0, -1) : (df || []);
 }
 
 // ═══════════════════════════════════════════════════════
-//  STAGE 3 VOTING LAYER — 5 independent confirmation voters
+//  SMC CONFIGURATION — every implementation parameter the
+//  Bible does NOT numerically define. See doc §36/§56.
 // ═══════════════════════════════════════════════════════
+export const SMC_CONFIG = {
+  structure: {
+    h4SwingLength:  3,
+    m15SwingLength: 3,
+    m1SwingLength:  2,
+  },
+  liquidity: {
+    equalLevelTolerance: 0.001, // 0.1%
+    sweepMinATR: 0.05,
+    sweepMaxATR: 1.00,
+  },
+  displacement: {
+    minBodyRatio: 0.60,
+    minRangeATR:  1.00,
+  },
+  poi: {
+    minScore: 10, // out of 14 — see scorePOI()
+  },
+  timing: {
+    maxPoiWaitM15:     48, // M15 candles the price has to return to the H4 POI
+    maxSweepToChochM1: 15,
+    maxChochToIbosM1:  15,
+    maxIbosToEntryM1:  20,
+  },
+  risk: {
+    minRR:    3.0,
+    fvgMinRR: 4.0, // directly from the Bible — author's own stated minimum for FVG entries
+    slBufferATR: 0.10,
+  },
+  management: {
+    proTrendBEAfterBOS:     2, // directly from the Bible
+    counterTrendBEAfterBOS: 1, // directly from the Bible
+  },
+};
 
-const VOTE_THRESHOLD        = 3; // need 3 of 5 voters to agree
-const RSI_PERIOD            = 14;
-const EMA_PERIOD             = 20;
-const EMA_SLOPE_LOOKBACK    = 5;
-const STREAK_MIN            = 3;
-const STRONG_CLOSE_PCT       = 0.75;
-const ZONE_BUFFER_ATR_MULT  = 0.10;
-
-function calcRsiSeries(dfM15, period = RSI_PERIOD) {
-  const closes = dfM15.map(c => c.close);
-  const rsi = new Array(closes.length).fill(null);
-  if (closes.length < period + 1) return rsi;
-  let gains = 0, losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff >= 0) gains += diff; else losses -= diff;
-  }
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-  rsi[period] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
-  for (let i = period + 1; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    const gain = diff > 0 ? diff : 0;
-    const loss = diff < 0 ? -diff : 0;
-    avgGain = (avgGain * (period - 1) + gain) / period;
-    avgLoss = (avgLoss * (period - 1) + loss) / period;
-    rsi[i] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
-  }
-  return rsi;
-}
-
-function calcEmaSeries(dfM15, period = EMA_PERIOD) {
-  const closes = dfM15.map(c => c.close);
-  const ema = new Array(closes.length).fill(null);
-  if (closes.length < period) return ema;
-  const k = 2 / (period + 1);
-  let seed = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  ema[period - 1] = seed;
-  for (let i = period; i < closes.length; i++) {
-    ema[i] = closes[i] * k + ema[i - 1] * (1 - k);
-  }
-  return ema;
-}
-
-function countCloseStreak(dfM15, idx, direction) {
-  let count = 0;
-  for (let i = idx; i >= 0; i--) {
-    const c = dfM15[i];
-    const matches = direction === "bullish" ? c.close > c.open : c.close < c.open;
-    if (matches) count++; else break;
-  }
-  return count;
-}
-
-function voteRsiReversal(rsiSeries, idx, dailyBias) {
-  if (idx < 1 || rsiSeries[idx] == null || rsiSeries[idx - 1] == null) return false;
-  if (dailyBias === "bullish") return rsiSeries[idx - 1] <= 30 && rsiSeries[idx] > 30;
-  return rsiSeries[idx - 1] >= 70 && rsiSeries[idx] < 70;
-}
-
-function voteMaSlope(emaSeries, dfM15, idx, dailyBias) {
-  const lookIdx = idx - EMA_SLOPE_LOOKBACK;
-  if (lookIdx < 0 || emaSeries[idx] == null || emaSeries[lookIdx] == null) return false;
-  if (dailyBias === "bullish") return emaSeries[idx] > emaSeries[lookIdx] && dfM15[idx].close > emaSeries[idx];
-  return emaSeries[idx] < emaSeries[lookIdx] && dfM15[idx].close < emaSeries[idx];
-}
-
-function voteStreak(dfM15, idx, dailyBias) {
-  return countCloseStreak(dfM15, idx, dailyBias) >= STREAK_MIN;
-}
-
-function voteStrongClose(c, dailyBias) {
-  const range = candleRange(c);
-  if (range === 0) return false;
-  if (dailyBias === "bullish") return (c.close - c.low) / range >= STRONG_CLOSE_PCT;
-  return (c.high - c.close) / range >= STRONG_CLOSE_PCT;
-}
-
-function voteDistanceFromZone(c, dailyBias, zoneHigh, zoneLow, atrM15) {
-  const buffer = atrM15 * ZONE_BUFFER_ATR_MULT;
-  if (dailyBias === "bullish") return (c.close - zoneHigh) >= buffer;
-  return (zoneLow - c.close) >= buffer;
-}
-
-function runVotes(c, idx, dfM15, dailyBias, zoneHigh, zoneLow, ctx) {
-  const details = [
-    { name: "RSI reversal",       pass: voteRsiReversal(ctx.rsiSeries, idx, dailyBias) },
-    { name: "MA slope/alignment", pass: voteMaSlope(ctx.emaSeries, dfM15, idx, dailyBias) },
-    { name: "Streak count",       pass: voteStreak(dfM15, idx, dailyBias) },
-    { name: "Strong close",       pass: voteStrongClose(c, dailyBias) },
-    { name: "Distance from zone", pass: voteDistanceFromZone(c, dailyBias, zoneHigh, zoneLow, ctx.atrM15) },
-  ];
-  const votesPassed = details.filter(v => v.pass).length;
-  return { votesPassed, total: details.length, details };
-}
-
-function checkRetracementIntoDailyZone(dfH1, dfD1) {
-  if (!dfH1 || dfH1.length < 2) return { retraced: false, reason: "Insufficient 1H data" };
-  if (!dfD1 || dfD1.length < 2) return { retraced: false, reason: "Insufficient daily data" };
-  const last = dfH1[dfH1.length - 2];
-  const yesterday = dfD1[dfD1.length - 2];
-  const yesterdayHigh = yesterday.high;
-  const yesterdayLow  = yesterday.low;
-  const closedInside = last.close <= yesterdayHigh && last.close >= yesterdayLow;
-  if (closedInside) {
-    return { retraced: true, reason: `1H candle closed at ${last.close.toFixed(5)} — back inside yesterday's range (${yesterdayLow.toFixed(5)} - ${yesterdayHigh.toFixed(5)})` };
-  }
-  return { retraced: false, reason: `Waiting for an 1H candle to close back inside yesterday's range (${yesterdayLow.toFixed(5)} - ${yesterdayHigh.toFixed(5)})` };
-}
-
-function check1hConfirmation(dailyBias, dfH1, dfD1) {
-  if (!dfH1 || dfH1.length < 3) return { confirmed: false, reason: "Insufficient 1H data" };
-  if (!dfD1 || dfD1.length < 2) return { confirmed: false, reason: "Insufficient daily data for yesterday's high/low" };
-  const len  = dfH1.length;
-  const last = dfH1[len - 2];
-  const yesterday = dfD1[dfD1.length - 2];
-  const yesterdayHigh = yesterday.high;
-  const yesterdayLow  = yesterday.low;
-
-  if (dailyBias === "bullish") {
-    const openAbove  = last.open  > yesterdayHigh;
-    const closeAbove = last.close > yesterdayHigh;
-    if (!openAbove || !closeAbove) {
-      return { confirmed: false, reason: `Waiting — 1H candle has not fully opened+closed above yesterday's high (${yesterdayHigh.toFixed(5)})` };
+// ═══════════════════════════════════════════════════════
+//  1. SWING DETECTION (doc §5)
+// ═══════════════════════════════════════════════════════
+function getSwingHighs(candles, k) {
+  const highs = [];
+  for (let i = k; i < candles.length - k; i++) {
+    let isHigh = true;
+    for (let j = i - k; j < i; j++) {
+      if (!(candles[i].high > candles[j].high)) { isHigh = false; break; }
     }
-    const shape = validateDailyCandle(last);
-    if (!shape.valid || shape.direction !== "bullish") {
-      return { confirmed: false, reason: `1H open+close above yesterday's high but candle shape invalid — ${shape.reason}` };
-    }
-    return { confirmed: true, h1Epoch: last.epoch, h1High: last.high, h1Low: last.low, reason: `1H candle confirmed above yesterday's high (${yesterdayHigh.toFixed(5)})` };
-  }
-  if (dailyBias === "bearish") {
-    const openBelow  = last.open  < yesterdayLow;
-    const closeBelow = last.close < yesterdayLow;
-    if (!openBelow || !closeBelow) {
-      return { confirmed: false, reason: `Waiting — 1H candle has not fully opened+closed below yesterday's low (${yesterdayLow.toFixed(5)})` };
-    }
-    const shape = validateDailyCandle(last);
-    if (!shape.valid || shape.direction !== "bearish") {
-      return { confirmed: false, reason: `1H open+close below yesterday's low but candle shape invalid — ${shape.reason}` };
-    }
-    return { confirmed: true, h1Epoch: last.epoch, h1High: last.high, h1Low: last.low, reason: `1H candle confirmed below yesterday's low (${yesterdayLow.toFixed(5)})` };
-  }
-  return { confirmed: false, reason: "No daily bias" };
-}
-
-function check15mEntry(dailyBias, dfM15, dfD1, state) {
-  if (!dfM15 || dfM15.length < 3) return { signal: SIG_HOLD, reason: "Insufficient 15M data" };
-  if (!state.entryModeH1Epoch) return { signal: SIG_HOLD, reason: "No confirmed H1 bar recorded for entry mode" };
-  if (dailyBias !== "bullish" && dailyBias !== "bearish") return { signal: SIG_HOLD, reason: "No daily bias" };
-
-  const zoneHigh = state.entryModeH1High;
-  const zoneLow  = state.entryModeH1Low;
-  const h1Epoch  = state.entryModeH1Epoch;
-
-  if (state.m15ScanEpoch === null) {
-    state.m15ScanEpoch = h1Epoch + 3600 - 1;
-  }
-
-  const len             = dfM15.length;
-  const lastClosedEpoch = dfM15[len - 2].epoch;
-  const toScan = dfM15
-    .filter(c => c.epoch > state.m15ScanEpoch && c.epoch <= lastClosedEpoch)
-    .sort((a, b) => a.epoch - b.epoch);
-
-  const waitingReason = () => state.pulledBack
-    ? `Pulled back inside the H1 confirmation zone (${zoneLow.toFixed(5)} - ${zoneHigh.toFixed(5)}) — waiting for a valid ${dailyBias} candle to close back beyond it`
-    : `Watching for a valid ${dailyBias} candle to close beyond the H1 confirmation zone (${zoneLow.toFixed(5)} - ${zoneHigh.toFixed(5)})`;
-
-  if (toScan.length === 0) return { signal: SIG_HOLD, reason: waitingReason() };
-
-  // PERFORMANCE FIX (not a logic change): the original computed
-  // RSI/EMA/ATR over the ENTIRE growing history array from scratch on
-  // every single scan cycle. As history accumulates (backtest OR live,
-  // since the bot's growing window only ever gets longer over time),
-  // that gets progressively slower — measured at 6+ seconds per symbol
-  // per call on real 1yr data. RSI(14)/EMA(20) only need a reasonable
-  // recent buffer, not the full history, so this windows it down
-  // without changing what any vote actually measures.
-  const INDICATOR_WINDOW = 300;
-  const windowStart = Math.max(0, dfM15.length - INDICATOR_WINDOW);
-  const windowedM15 = dfM15.slice(windowStart);
-
-  const rsiSeries = calcRsiSeries(windowedM15);
-  const emaSeries = calcEmaSeries(windowedM15);
-  const atrM15    = calcAtr(windowedM15);
-  const voteCtx   = { rsiSeries, emaSeries, atrM15 };
-
-  for (const c of toScan) {
-    state.m15ScanEpoch = c.epoch;
-    state.m15EntryAttempts++;
-    const shape            = validateDailyCandle(c);
-    const shapeOk           = shape.valid && shape.direction === dailyBias;
-    const closesBeyondZone  = dailyBias === "bullish" ? c.close > zoneHigh : c.close < zoneLow;
-
-    if (shapeOk && closesBeyondZone) {
-      const idx = windowedM15.findIndex(x => x.epoch === c.epoch);
-      const { votesPassed, total, details } = runVotes(c, idx, windowedM15, dailyBias, zoneHigh, zoneLow, voteCtx);
-
-      if (votesPassed >= VOTE_THRESHOLD) {
-        const direction  = dailyBias === "bullish" ? "buy" : "sell";
-        const votesList  = details.filter(v => v.pass).map(v => v.name).join(", ");
-        return {
-          signal: direction === "buy" ? SIG_BUY : SIG_SELL,
-          reason: `Valid ${dailyBias} candle closed beyond zone AND passed ${votesPassed}/${total} votes (${votesList}) on attempt ${state.m15EntryAttempts}/2 — entering now`,
-        };
+    if (isHigh) {
+      for (let j = i + 1; j <= i + k; j++) {
+        if (!(candles[i].high >= candles[j].high)) { isHigh = false; break; }
       }
-      const failedList = details.filter(v => !v.pass).map(v => v.name).join(", ");
-      state.lastVoteReason = `Closed beyond zone but only ${votesPassed}/${total} votes passed (need ${VOTE_THRESHOLD}) — missing: ${failedList}`;
-    } else {
-      const closesInsideZone = c.close >= zoneLow && c.close <= zoneHigh;
-      if (closesInsideZone) state.pulledBack = true;
     }
+    if (isHigh) highs.push({ idx: i, price: candles[i].high, epoch: candles[i].epoch, type: "H" });
+  }
+  return highs;
+}
 
-    if (state.m15EntryAttempts >= 2) {
-      return {
-        signal: SIG_HOLD,
-        abandoned: true,
-        reason: `Neither the 1st nor 2nd 15M candle after the H1 breakout cleared both the zone-break AND the vote threshold — abandoning this setup. Waiting for a retracement into yesterday's daily range before watching for a fresh breakout.`,
-      };
+function getSwingLows(candles, k) {
+  const lows = [];
+  for (let i = k; i < candles.length - k; i++) {
+    let isLow = true;
+    for (let j = i - k; j < i; j++) {
+      if (!(candles[i].low < candles[j].low)) { isLow = false; break; }
+    }
+    if (isLow) {
+      for (let j = i + 1; j <= i + k; j++) {
+        if (!(candles[i].low <= candles[j].low)) { isLow = false; break; }
+      }
+    }
+    if (isLow) lows.push({ idx: i, price: candles[i].low, epoch: candles[i].epoch, type: "L" });
+  }
+  return lows;
+}
+
+// ═══════════════════════════════════════════════════════
+//  2. MARKET STRUCTURE — HH/HL/LL/LH, protected levels,
+//     BOS structure levels (doc §6-9)
+// ═══════════════════════════════════════════════════════
+function buildStructure(candles, k) {
+  const highs = getSwingHighs(candles, k);
+  const lows  = getSwingLows(candles, k);
+  const points = [...highs, ...lows].sort((a, b) => a.idx - b.idx);
+
+  // Collapse consecutive same-type points to the more extreme one
+  // (a real alternating HH/HL/LL/LH sequence never has two highs
+  // in a row without a low between them at this resolution).
+  const alt = [];
+  for (const p of points) {
+    const last = alt[alt.length - 1];
+    if (!last || last.type !== p.type) {
+      alt.push(p);
+    } else if (p.type === "H" && p.price > last.price) {
+      alt[alt.length - 1] = p;
+    } else if (p.type === "L" && p.price < last.price) {
+      alt[alt.length - 1] = p;
     }
   }
 
-  if (state.lastVoteReason) return { signal: SIG_HOLD, reason: state.lastVoteReason };
-  return { signal: SIG_HOLD, reason: waitingReason() };
+  let trend = "NEUTRAL";
+  let protectedHigh = null, protectedLow = null;
+  let structureHigh = null, structureLow = null;
+
+  for (let i = 1; i < alt.length; i++) {
+    const prev = alt[i - 1], cur = alt[i];
+    if (cur.type === "H") {
+      const priorHighs = alt.slice(0, i).filter(p => p.type === "H");
+      const priorHigh  = priorHighs[priorHighs.length - 1];
+      if (priorHigh && cur.price > priorHigh.price) {
+        structureHigh = cur;
+        trend = "BULLISH";
+        if (prev.type === "L") protectedLow = prev;
+      }
+    } else {
+      const priorLows = alt.slice(0, i).filter(p => p.type === "L");
+      const priorLow  = priorLows[priorLows.length - 1];
+      if (priorLow && cur.price < priorLow.price) {
+        structureLow = cur;
+        trend = "BEARISH";
+        if (prev.type === "H") protectedHigh = prev;
+      }
+    }
+  }
+
+  return { trend, protectedHigh, protectedLow, structureHigh, structureLow, swings: alt };
 }
 
+function nearestBSLBefore(structure, idx) {
+  const highs = structure.swings.filter(s => s.type === "H" && s.idx < idx);
+  return highs.length ? highs[highs.length - 1] : null;
+}
+function nearestSSLBefore(structure, idx) {
+  const lows = structure.swings.filter(s => s.type === "L" && s.idx < idx);
+  return lows.length ? lows[lows.length - 1] : null;
+}
+
+// ═══════════════════════════════════════════════════════
+//  3. LIQUIDITY SWEEP (doc §16-18)
+// ═══════════════════════════════════════════════════════
+function detectSweep(candle, liquidityPrice, atr, side, config) {
+  if (liquidityPrice == null || !atr) return null;
+  if (side === "SSL") {
+    if (candle.low < liquidityPrice && candle.close > liquidityPrice) {
+      const depth = (liquidityPrice - candle.low) / atr;
+      if (depth >= config.liquidity.sweepMinATR && depth <= config.liquidity.sweepMaxATR) {
+        return { type: "BULLISH_SSL_SWEEP", liquidityPrice, sweepLow: candle.low, depth, epoch: candle.epoch };
+      }
+    }
+  } else {
+    if (candle.high > liquidityPrice && candle.close < liquidityPrice) {
+      const depth = (candle.high - liquidityPrice) / atr;
+      if (depth >= config.liquidity.sweepMinATR && depth <= config.liquidity.sweepMaxATR) {
+        return { type: "BEARISH_BSL_SWEEP", liquidityPrice, sweepHigh: candle.high, depth, epoch: candle.epoch };
+      }
+    }
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════
+//  4. DISPLACEMENT / MOMENTUM (doc §18/§25)
+// ═══════════════════════════════════════════════════════
+function detectDisplacement(candle, atr, config) {
+  const range = candle.high - candle.low;
+  const body  = Math.abs(candle.close - candle.open);
+  if (range === 0 || !atr) return null;
+  const bodyRatio = body / range;
+  const rangeATR  = range / atr;
+  if (bodyRatio < config.displacement.minBodyRatio || rangeATR < config.displacement.minRangeATR) return null;
+  if (candle.close > candle.open) return "BULLISH";
+  if (candle.close < candle.open) return "BEARISH";
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════
+//  5. ORDER BLOCK (doc §26-29)
+// ═══════════════════════════════════════════════════════
+function findOrderBlock(candles, direction) {
+  for (let i = candles.length - 2, steps = 0; i >= 0 && steps < 6; i--, steps++) {
+    const c = candles[i];
+    if (direction === "BULLISH" && c.close < c.open) {
+      return { high: c.high, low: c.low, epoch: c.epoch, type: "BULLISH_OB" };
+    }
+    if (direction === "BEARISH" && c.close > c.open) {
+      return { high: c.high, low: c.low, epoch: c.epoch, type: "BEARISH_OB" };
+    }
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════
+//  6. FAIR VALUE GAP (doc §30-31)
+// ═══════════════════════════════════════════════════════
+function findFVG(candles) {
+  if (candles.length < 3) return null;
+  const [a, , c] = candles.slice(-3);
+  if (c.low > a.high) return { type: "BULLISH_FVG", low: a.high, high: c.low, mid: (a.high + c.low) / 2 };
+  if (c.high < a.low) return { type: "BEARISH_FVG", low: c.high, high: a.low, mid: (c.high + a.low) / 2 };
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════
+//  7. PREMIUM / DISCOUNT (doc §20)
+// ═══════════════════════════════════════════════════════
+function premiumDiscount(structure, price) {
+  const leg = structure.trend === "BULLISH"
+    ? { high: structure.structureHigh?.price, low: structure.protectedLow?.price }
+    : { high: structure.protectedHigh?.price, low: structure.structureLow?.price };
+  if (leg.high == null || leg.low == null) return null;
+  const equilibrium = (leg.high + leg.low) / 2;
+  const zone = price < equilibrium ? "DISCOUNT" : (price > equilibrium ? "PREMIUM" : "EQUILIBRIUM");
+  return { equilibrium, zone, leg };
+}
+
+// ═══════════════════════════════════════════════════════
+//  8. POI SCORE (doc §23-24)
+// ═══════════════════════════════════════════════════════
+function scorePOI({ bos, momentum, liquidity, imbalance, sweep, inducement }) {
+  return (bos ? 3 : 0) + (momentum ? 3 : 0) + (liquidity ? 3 : 0)
+       + (imbalance ? 2 : 0) + (sweep ? 2 : 0) + (inducement ? 1 : 0);
+}
+
+// ═══════════════════════════════════════════════════════
+//  9. FULL SETUP ANALYSIS — H4 -> M15 -> M1 (doc §37-38)
+// ═══════════════════════════════════════════════════════
+function analyzeSmcSetup(h4, m15, m1, config, debug) {
+  const reject = (msg) => { debug.push(`SMC_REJECT: ${msg}`); return null; };
+
+  const h4c = closed(h4);
+  if (h4c.length < config.structure.h4SwingLength * 2 + 15) return reject("Insufficient H4 data");
+
+  const h4Structure = buildStructure(h4c, config.structure.h4SwingLength);
+  if (h4Structure.trend === "NEUTRAL") return reject("H4 trend neutral");
+
+  const m15c = closed(m15);
+  const m1c  = closed(m1);
+  if (m15c.length < 30) return reject("Insufficient M15 data");
+  if (m1c.length  < 30) return reject("Insufficient M1 data");
+
+  const price = m1c[m1c.length - 1].close;
+  const pd = premiumDiscount(h4Structure, price);
+  if (!pd) return reject("H4 structural leg incomplete — no premium/discount reference yet");
+
+  const direction = h4Structure.trend === "BULLISH" ? "LONG" : "SHORT";
+  if (direction === "LONG"  && pd.zone !== "DISCOUNT") return reject(`H4 bullish but price in ${pd.zone.toLowerCase()}, not discount`);
+  if (direction === "SHORT" && pd.zone !== "PREMIUM")  return reject(`H4 bearish but price in ${pd.zone.toLowerCase()}, not premium`);
+
+  // ── H4 POI ──
+  const atrH4  = calcAtr(h4c);
+  const refPoint = direction === "LONG" ? h4Structure.structureHigh : h4Structure.structureLow;
+  if (!refPoint) return reject("No confirmed H4 structural break to anchor a POI");
+
+  const obDir = direction === "LONG" ? "BULLISH" : "BEARISH";
+  const ob    = findOrderBlock(h4c.slice(0, refPoint.idx + 1), obDir);
+  if (!ob) return reject("No H4 order block found at structural break");
+
+  const bosCandle = h4c[refPoint.idx];
+  const momentum  = detectDisplacement(bosCandle, atrH4, config) === obDir;
+  const fvg       = findFVG(h4c.slice(Math.max(0, refPoint.idx - 2), refPoint.idx + 1));
+  const priorLiquidity = obDir === "BULLISH"
+    ? nearestBSLBefore(h4Structure, refPoint.idx)
+    : nearestSSLBefore(h4Structure, refPoint.idx);
+
+  const poiScore = scorePOI({
+    bos: true, momentum, liquidity: !!priorLiquidity, imbalance: !!fvg, sweep: !!priorLiquidity, inducement: false,
+  });
+  if (!momentum) return reject("POI has BOS but momentum/displacement threshold not met");
+  if (poiScore < config.poi.minScore) return reject(`POI score ${poiScore} < required ${config.poi.minScore}`);
+
+  // ── M15: price back in the H4 POI + M15 liquidity sweep ──
+  const inZoneWindow = m15c.slice(-config.timing.maxPoiWaitM15);
+  const inZone = inZoneWindow.some(c => c.low <= ob.high && c.high >= ob.low);
+  if (!inZone) return reject("Price has not returned into the H4 POI zone on M15 within the wait window");
+
+  const m15Structure = buildStructure(m15c, config.structure.m15SwingLength);
+  const atrM15 = calcAtr(m15c);
+  const m15LiquidityPoint = direction === "LONG"
+    ? m15Structure.swings.filter(s => s.type === "L").at(-1)
+    : m15Structure.swings.filter(s => s.type === "H").at(-1);
+  if (!m15LiquidityPoint) return reject(direction === "LONG" ? "No valid SSL on M15" : "No valid BSL on M15");
+
+  let m15Sweep = null;
+  for (const c of inZoneWindow) {
+    const s = detectSweep(c, m15LiquidityPoint.price, atrM15, direction === "LONG" ? "SSL" : "BSL", config);
+    if (s) m15Sweep = s;
+  }
+  if (!m15Sweep) return reject(direction === "LONG" ? "SSL sweep did not occur/close back above liquidity" : "BSL sweep did not occur/close back below liquidity");
+
+  // ── M1: CHoCH -> internal BOS (C-I model) -> OB/FVG entry ──
+  const m1Structure = buildStructure(m1c, config.structure.m1SwingLength);
+  const chochLevel = direction === "LONG" ? m1Structure.protectedHigh : m1Structure.protectedLow;
+  if (!chochLevel) return reject("No M1 protected level to test for CHoCH");
+
+  let chochIdx = -1;
+  const chochScanStart = Math.max(0, m1c.length - config.timing.maxSweepToChochM1);
+  for (let i = chochScanStart; i < m1c.length; i++) {
+    const c = m1c[i];
+    if (direction === "LONG"  && c.close > chochLevel.price) { chochIdx = i; break; }
+    if (direction === "SHORT" && c.close < chochLevel.price) { chochIdx = i; break; }
+  }
+  if (chochIdx === -1) return reject("CHoCH not confirmed by candle close within timing window");
+
+  let ibosIdx = -1;
+  let runningExtreme = direction === "LONG" ? m1c[chochIdx].high : m1c[chochIdx].low;
+  const ibosScanEnd = Math.min(m1c.length, chochIdx + 1 + config.timing.maxChochToIbosM1);
+  for (let i = chochIdx + 1; i < ibosScanEnd; i++) {
+    const c = m1c[i];
+    if (direction === "LONG") {
+      if (c.close > runningExtreme) { ibosIdx = i; break; }
+      runningExtreme = Math.max(runningExtreme, c.high);
+    } else {
+      if (c.close < runningExtreme) { ibosIdx = i; break; }
+      runningExtreme = Math.min(runningExtreme, c.low);
+    }
+  }
+  if (ibosIdx === -1) return reject("Internal BOS not detected within timing window");
+
+  const atrM1   = calcAtr(m1c);
+  const entryDir = direction === "LONG" ? "BULLISH" : "BEARISH";
+  const entryOb  = findOrderBlock(m1c.slice(0, ibosIdx + 1), entryDir);
+  const entryFvg = findFVG(m1c.slice(Math.max(0, ibosIdx - 2), ibosIdx + 1));
+  if (!entryOb && !entryFvg) return reject("No M1 order block or FVG created by the internal-BOS displacement");
+
+  let entryType, entry, slAnchor;
+  if (entryOb) {
+    entryType = "ORDER_BLOCK";
+    entry     = (entryOb.high + entryOb.low) / 2;
+    slAnchor  = direction === "LONG" ? entryOb.low : entryOb.high;
+  } else {
+    entryType = "FVG";
+    entry     = entryFvg.mid;
+    slAnchor  = direction === "LONG" ? ob.low : ob.high; // H4 POI boundary
+  }
+
+  const buffer   = atrM1 * config.risk.slBufferATR;
+  const stopLoss = direction === "LONG" ? slAnchor - buffer : slAnchor + buffer;
+
+  const oppositeM15 = direction === "LONG"
+    ? m15Structure.swings.filter(s => s.type === "H").at(-1)
+    : m15Structure.swings.filter(s => s.type === "L").at(-1);
+  const oppositeH4 = direction === "LONG"
+    ? h4Structure.swings.filter(s => s.type === "H").at(-1)
+    : h4Structure.swings.filter(s => s.type === "L").at(-1);
+  const takeProfit = oppositeM15?.price ?? oppositeH4?.price ?? null;
+  if (takeProfit == null) return reject("No opposing liquidity target found for take-profit");
+
+  const risk = Math.abs(entry - stopLoss);
+  if (risk <= 0) return reject("Invalid stop distance (zero/negative risk)");
+  const reward = Math.abs(takeProfit - entry);
+  const rr = reward / risk;
+
+  const minRR = entryType === "FVG" ? config.risk.fvgMinRR : config.risk.minRR;
+  if (rr < minRR) return reject(`${entryType} RR ${rr.toFixed(2)} < required ${minRR}`);
+
+  return {
+    direction, entryType, entry, stopLoss, takeProfit, rr: +rr.toFixed(2), poiScore,
+    h4Trend: h4Structure.trend, pdZone: pd.zone,
+    m1EntryEpoch: m1c[ibosIdx].epoch,
+    confirmations: {
+      h4Bias: true, h4PremiumDiscount: true, validPOI: true, bos: true, momentum,
+      liquidity: !!priorLiquidity, imbalance: !!fvg, sweep: true, choch: true, internalBos: true,
+    },
+    metadata: {
+      h4POI: { high: ob.high, low: ob.low },
+      m15Sweep, chochLevel: chochLevel.price, ibosEpoch: m1c[ibosIdx].epoch,
+      takeProfitSource: oppositeM15 ? "M15" : "H4",
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════
+//  10. PUBLIC ENTRY POINTS
+// ═══════════════════════════════════════════════════════
+
+/**
+ * @param {object} tf - { h4, m15, m1, symbol }
+ */
 export function collectSignals(tf) {
-  const { d1, h1, m15, symbol } = tf;
+  const { h4, m15, m1, symbol } = tf || {};
   const state = getState(symbol || "default");
   const breakdown = [];
+  const debug = [];
 
-  const latestClosedD1Epoch = (d1 && d1.length >= 2) ? d1[d1.length - 2].epoch : null;
-
-  if (latestClosedD1Epoch !== null && state.dailyBiasEpoch !== latestClosedD1Epoch) {
-    const result = computeDailyBias(d1);
-    state.dailyBiasEpoch = latestClosedD1Epoch;
-    state.dailyBias      = result.bias;
-    state.dailyBiasMeta  = result.reason;
-    state.entryMode      = false;
-    state.entryModeReason = "";
-    state.entryModeH1Epoch = null;
-    state.entryModeH1High  = null;
-    state.entryModeH1Low   = null;
-    state.pulledBack        = false;
-    state.m15ScanEpoch      = null;
-    state.lastVoteReason    = null;
-    state.m15EntryAttempts    = 0;
-    state.awaitingRetracement = false;
-  } else if (latestClosedD1Epoch === null && state.dailyBiasEpoch === null) {
-    const result = computeDailyBias(d1);
-    state.dailyBias     = result.bias;
-    state.dailyBiasMeta = result.reason;
-  }
-
-  breakdown.push({ step: "Stage1 DailyBias", result: state.dailyBias.toUpperCase(), reason: state.dailyBiasMeta });
-
-  if (state.dailyBias === "none") {
-    return { signal: SIG_HOLD, breakdown, reason: `NO TRADE TODAY — ${state.dailyBiasMeta}`, dailyBias: "none" };
+  if (!h4 || !m15 || !m1) {
+    return { signal: SIG_HOLD, breakdown, reason: "Missing timeframe data (h4/m15/m1)", bias: "none" };
   }
 
   if (!isInTradingSession(symbol)) {
-    breakdown.push({ step: "Stage2 1H Confirm", result: "OUTSIDE SESSION", reason: `${symbol} — waiting for London/NY session (FX only)` });
-    return { signal: SIG_HOLD, breakdown, reason: "Outside London/NY trading session — bias held for next session", dailyBias: state.dailyBias };
+    breakdown.push({ step: "Session", result: "OUTSIDE SESSION", reason: `${symbol} — waiting for London/NY session (FX only)` });
+    return { signal: SIG_HOLD, breakdown, reason: "Outside London/NY trading session — SMC held for next session", bias: "none" };
   }
 
-  if (!state.entryMode) {
-    if (state.awaitingRetracement) {
-      const retracement = checkRetracementIntoDailyZone(h1, d1);
-      breakdown.push({ step: "Stage2 Retracement Gate", result: retracement.retraced ? "RETRACED" : "WAITING", reason: retracement.reason });
-      if (!retracement.retraced) {
-        return { signal: SIG_HOLD, breakdown, reason: `WAITING — ${retracement.reason}`, dailyBias: state.dailyBias };
-      }
-      state.awaitingRetracement = false;
-    }
+  const setup = analyzeSmcSetup(h4, m15, m1, SMC_CONFIG, debug);
+  const lastReject = debug[debug.length - 1] || "No SMC setup";
 
-    const confirmation = check1hConfirmation(state.dailyBias, h1, d1);
-    breakdown.push({ step: "Stage2 1H Confirm", result: confirmation.confirmed ? "ENTRY MODE" : "WAITING", reason: confirmation.reason });
-    if (!confirmation.confirmed) {
-      return { signal: SIG_HOLD, breakdown, reason: `WAITING — ${confirmation.reason}`, dailyBias: state.dailyBias };
-    }
-    state.entryMode = true;
-    state.entryModeReason = confirmation.reason;
-    state.entryModeH1Epoch = confirmation.h1Epoch;
-    state.entryModeH1High  = confirmation.h1High;
-    state.entryModeH1Low   = confirmation.h1Low;
-    state.pulledBack        = false;
-    state.m15ScanEpoch      = null;
-    state.lastVoteReason    = null;
-    state.m15EntryAttempts  = 0;
-  } else {
-    breakdown.push({ step: "Stage2 1H Confirm", result: "ENTRY MODE (active)", reason: state.entryModeReason });
+  breakdown.push({ step: "SMC Setup", result: setup ? setup.direction : "NO_SIGNAL", reason: setup ? "Full sequence confirmed" : lastReject });
+
+  if (!setup) {
+    return { signal: SIG_HOLD, breakdown, reason: lastReject, bias: "none", debug };
   }
 
-  const entry = check15mEntry(state.dailyBias, m15, d1, state);
-  breakdown.push({
-    step: "Stage3 15M Entry",
-    result: entry.signal === SIG_HOLD ? (entry.abandoned ? "ABANDONED" : "WAIT") : (entry.signal === SIG_BUY ? "BUY" : "SELL"),
-    reason: entry.reason,
-  });
-
-  if (entry.abandoned) {
-    state.entryMode         = false;
-    state.entryModeReason   = "";
-    state.entryModeH1Epoch  = null;
-    state.entryModeH1High   = null;
-    state.entryModeH1Low    = null;
-    state.pulledBack        = false;
-    state.m15ScanEpoch      = null;
-    state.lastVoteReason    = null;
-    state.m15EntryAttempts  = 0;
-    state.awaitingRetracement = true;
-    return { signal: SIG_HOLD, breakdown, reason: entry.reason, dailyBias: state.dailyBias };
+  if (state.lastSignalEpoch === setup.m1EntryEpoch) {
+    return { signal: SIG_HOLD, breakdown, reason: "Setup already signaled on this M1 candle — waiting for a new one", bias: setup.h4Trend.toLowerCase(), debug };
   }
+  state.lastSignalEpoch = setup.m1EntryEpoch;
 
-  if (entry.signal !== SIG_HOLD) {
-    state.entryMode = false;
-  }
-
-  return { signal: entry.signal, breakdown, reason: entry.reason, dailyBias: state.dailyBias };
+  return {
+    signal: setup.direction === "LONG" ? SIG_BUY : SIG_SELL,
+    breakdown,
+    reason: `SMC ${setup.direction} — ${setup.entryType} entry, POI score ${setup.poiScore}/14, RR ${setup.rr}`,
+    bias: setup.h4Trend.toLowerCase(),
+    setup,
+    debug,
+  };
 }
 
 export function getTradeReason(tf) {
   const result = collectSignals(tf);
   const direction = result.signal === SIG_BUY ? "BUY" : result.signal === SIG_SELL ? "SELL" : "HOLD/WAIT";
-  const lines = [`DAILY BIAS STRATEGY (voting candidate) — ${direction}`];
+  const lines = [`SMC BIBLE STRATEGY (H4 -> M15 -> M1) — ${direction}`];
   for (const step of result.breakdown) lines.push(`  ${step.step}: ${step.result} — ${step.reason}`);
+  if (result.setup) {
+    const s = result.setup;
+    lines.push(`  Entry: ${s.entryType} @ ${s.entry} | SL ${s.stopLoss} | TP ${s.takeProfit} | RR ${s.rr}`);
+  }
   return lines.join("\n");
 }
 
-export function getLatestSignalMtf(dfM15, dfH1, dfD1, symbol) {
-  return collectSignals({ d1: dfD1, h1: dfH1, m15: dfM15, symbol }).signal;
+export function getLatestSignalMtf(dfM1, dfM15, dfH4, symbol) {
+  return collectSignals({ h4: dfH4, m15: dfM15, m1: dfM1, symbol }).signal;
 }
 
-export function get15mTrend(dfD1) {
-  const result = computeDailyBias(dfD1);
-  if (result.bias === "bullish") return "bullish";
-  if (result.bias === "bearish") return "bearish";
+export function getH4Trend(dfH4) {
+  const c = closed(dfH4);
+  if (!c || c.length < SMC_CONFIG.structure.h4SwingLength * 2 + 5) return "neutral";
+  const structure = buildStructure(c, SMC_CONFIG.structure.h4SwingLength);
+  if (structure.trend === "BULLISH") return "bullish";
+  if (structure.trend === "BEARISH") return "bearish";
   return "neutral";
+}
+
+// Back-compat alias — previously took the D1 window, now takes H4.
+export function get15mTrend(dfH4) {
+  return getH4Trend(dfH4);
 }
